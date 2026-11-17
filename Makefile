@@ -23,3 +23,5 @@ sanitize: build/test_cache_sanitize
 
 clean:
 	rm -f build/test_cache build/test_cache_sanitize
+
+include cliente.mk
