@@ -28,6 +28,7 @@ typedef struct {
     int theta_given;
     int metrics;
     const char *latency_csv;
+    int b0;
 } options_t;
 
 static void usage(FILE *stream, const char *program)
@@ -40,12 +41,13 @@ static void usage(FILE *stream, const char *program)
         "          [--pattern sequential|uniform|zipf] [--seed UINT64]\n"
         "          [--zipf-theta VALUE] (0 < VALUE <= 2, zipf only)\n"
         "          [--metrics on|off] [--latency-csv NEW_FILE] (metrics on only)\n"
+        "          [--baseline none|b0] (default none; b0 requires cache=working-set)\n"
         "Metrics default=on; exact samples and byte coverage add overhead.\n"
         "Sizes are positive decimal bytes, without unit suffixes.\n"
         "Defaults: block=4096 cache=33554432 working-set=268435456 accesses=1000000\n"
         "Default backend=synthetic host=127.0.0.1 port=18083.\n"
         "Default pattern=sequential seed=42 zipf-theta=1.1.\n"
-        "Aligned 8-byte reads; starts with an empty cache.\n",
+        "Aligned 8-byte reads; empty cache unless --baseline b0 warms all blocks.\n",
         program);
 }
 
@@ -84,6 +86,15 @@ static int positive_size(const char *text, size_t *value)
 static int parse_options(int argc, char **argv, options_t *options)
 {
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--baseline") == 0) {
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "none") != 0 &&
+                                  strcmp(argv[i + 1], "b0") != 0)) {
+                fputs("Invalid baseline: use none or b0.\n", stderr);
+                return -1;
+            }
+            options->b0 = strcmp(argv[++i], "b0") == 0;
+            continue;
+        }
         if (strcmp(argv[i], "--metrics") == 0) {
             if (i + 1 >= argc || (strcmp(argv[i + 1], "on") != 0 &&
                                   strcmp(argv[i + 1], "off") != 0)) {
@@ -160,6 +171,10 @@ static int parse_options(int argc, char **argv, options_t *options)
             fprintf(stderr, "Invalid positive integer: %s\n", argv[i]);
             return -1;
         }
+    }
+    if (options->b0 && options->cache_bytes != options->working_set_bytes) {
+        fputs("B0 requires cache-size equal to working-set (100% payload).\n", stderr);
+        return -1;
     }
     if (!options->metrics && options->latency_csv != NULL) {
         fputs("--latency-csv requires --metrics on.\n", stderr);
@@ -337,7 +352,7 @@ int main(int argc, char **argv)
 {
     options_t options = {4096, 33554432, 268435456, 1000000,
                           "synthetic", "127.0.0.1", 18083, NULL,
-                          "sequential", 42, 1.1, 0, 1, NULL};
+                          "sequential", 42, 1.1, 0, 1, NULL, 0};
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         usage(stdout, argv[0]);
         return EXIT_SUCCESS;
@@ -392,6 +407,39 @@ int main(int argc, char **argv)
         fputs("Could not allocate metrics memory; reduce accesses or cache size.\n", stderr);
         goto cleanup;
     }
+    cache_stats_t warmup = {0};
+    double warmup_seconds = 0.0;
+    if (options.b0) {
+        struct timespec warm_start, warm_end;
+        if (clock_gettime(CLOCK_MONOTONIC_RAW, &warm_start) != 0) {
+            perror("Warmup clock");
+            goto cleanup;
+        }
+        size_t blocks = options.working_set_bytes / options.block_size;
+        for (size_t id = 0; id < blocks; id++) {
+            unsigned char bytes[8];
+            if (cache_read(cache, (uint64_t)id, 0, bytes, sizeof(bytes)) != 0) {
+                fprintf(stderr, "B0 warmup failed at block %zu; measurement not started.\n", id);
+                goto cleanup;
+            }
+        }
+        if (clock_gettime(CLOCK_MONOTONIC_RAW, &warm_end) != 0) {
+            perror("Warmup clock");
+            goto cleanup;
+        }
+        warmup_seconds = elapsed_seconds(warm_start, warm_end);
+        warmup = cache_get_stats(cache);
+        if (warmup.requests != blocks || warmup.misses != blocks || warmup.hits != 0 ||
+            warmup.evictions != 0 || warmup.load_errors != 0 ||
+            cache_reset_observations(cache) != 0) {
+            fputs("Invalid B0 warmup state; measurement not started.\n", stderr);
+            goto cleanup;
+        }
+    }
+    /* Snapshot backend counters; their state and connection stay intact.
+     * Workload state and latency samples were not touched during warmup. */
+    uint64_t warm_tcp_requests = tcp.requests, warm_tcp_bytes = tcp.payload_bytes;
+    uint64_t warm_sd_requests = sd.requests, warm_sd_calls = sd.read_calls, warm_sd_bytes = sd.read_bytes;
     struct timespec start, end;
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &start) != 0) {
         perror("clock_gettime");
@@ -444,16 +492,36 @@ int main(int argc, char **argv)
         perror("clock_gettime");
         goto cleanup;
     }
+    cache_stats_t stats = cache_get_stats(cache);
+    if (options.b0 && (stats.requests != options.accesses || stats.hits != options.accesses ||
+                      stats.misses != 0 || stats.evictions != 0 || stats.load_errors != 0 ||
+                      tcp.requests != warm_tcp_requests || tcp.payload_bytes != warm_tcp_bytes ||
+                      sd.requests != warm_sd_requests || sd.read_calls != warm_sd_calls ||
+                      sd.read_bytes != warm_sd_bytes)) {
+        fputs("B0 validation failed: measurement must have only hits and no backend I/O.\n", stderr);
+        goto cleanup;
+    }
     if (options.latency_csv != NULL && export_latencies(&latencies, options.latency_csv) != 0)
         goto cleanup;
     double seconds = elapsed_seconds(start, end);
-    cache_stats_t stats = cache_get_stats(cache);
-    printf("backend=%s\npattern=%s\ncache_start=empty\n"
+    printf("baseline=%s\nb0_verified=%s\n", options.b0 ? "b0" : "none",
+           options.b0 ? "1" : "na");
+    printf("warmup_requests=%" PRIu64 "\nwarmup_hits=%" PRIu64 "\nwarmup_misses=%" PRIu64
+           "\nwarmup_evictions=%" PRIu64 "\nwarmup_load_errors=%" PRIu64
+           "\nwarmup_elapsed_seconds=%.9f\n", warmup.requests, warmup.hits, warmup.misses,
+           warmup.evictions, warmup.load_errors, warmup_seconds);
+    printf("warmup_tcp_requests=%" PRIu64 "\nwarmup_tcp_payload_bytes=%" PRIu64
+           "\nwarmup_sd_requests=%" PRIu64 "\nwarmup_sd_read_calls=%" PRIu64
+           "\nwarmup_sd_read_bytes=%" PRIu64 "\n", warm_tcp_requests, warm_tcp_bytes,
+           warm_sd_requests, warm_sd_calls, warm_sd_bytes);
+    puts("backend_request_counters_scope=measurement_only\ntcp_connections_scope=whole_process");
+    printf("backend=%s\npattern=%s\ncache_start=%s\n"
            "read_bytes=8\nblock_size_bytes=%zu\ncache_payload_bytes=%zu\n"
            "working_set_bytes=%zu\nrequests=%" PRIu64 "\nhits=%" PRIu64
            "\nmisses=%" PRIu64 "\nevictions=%" PRIu64
            "\nload_errors=%" PRIu64 "\n",
-           options.backend, options.pattern, options.block_size, options.cache_bytes, options.working_set_bytes,
+           options.backend, options.pattern, options.b0 ? "warm_full" : "empty",
+           options.block_size, options.cache_bytes, options.working_set_bytes,
            stats.requests, stats.hits, stats.misses, stats.evictions, stats.load_errors);
     printf("hit_rate=%.9f\nmiss_rate=%.9f\nchecksum=%" PRIu64 "\n",
            (double)stats.hits / (double)stats.requests,
@@ -469,14 +537,15 @@ int main(int argc, char **argv)
     printf("elapsed_seconds=%.9f\naccesses_per_second=%.3f\n",
            seconds, seconds > 0.0 ? (double)stats.requests / seconds : 0.0);
     printf("tcp_connections=%d\ntcp_requests=%" PRIu64 "\ntcp_payload_bytes=%" PRIu64 "\n",
-           use_tcp ? 1 : 0, tcp.requests, tcp.payload_bytes);
+           use_tcp ? 1 : 0, tcp.requests - warm_tcp_requests, tcp.payload_bytes - warm_tcp_bytes);
     printf("sd_open_direct=%d\nsd_alignment_source=%s\n"
            "sd_memory_alignment_bytes=%zu\nsd_offset_alignment_bytes=%zu\n"
            "sd_requests=%" PRIu64 "\nsd_read_calls=%" PRIu64
            "\nsd_read_bytes=%" PRIu64 "\n",
            use_sd ? 1 : 0, use_sd ? "statx" : "none",
            sd.memory_alignment, sd.offset_alignment,
-           sd.requests, sd.read_calls, sd.read_bytes);
+           sd.requests - warm_sd_requests, sd.read_calls - warm_sd_calls, sd.read_bytes - warm_sd_bytes);
+    puts("block_usage_window=measurement_only\nblock_usage_population=resident_at_start_or_loaded_during_measurement");
     printf("metrics_enabled=%d\n", options.metrics);
     puts("timing_scope=loop_including_generator_backend_checksums_and_optional_metrics_excluding_setup_and_summary");
     if (options.metrics && print_metrics(&latencies, cache, options.block_size) != 0)
