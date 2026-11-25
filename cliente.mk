@@ -1,9 +1,11 @@
 # Included from the existing Makefile; preserves all cache test targets.
-CLIENT_SOURCES = src/cache.c src/workload.c src/client.c src/backend_tcp.c src/protocol.c
-CLIENT_HEADERS = include/cache.h include/workload.h include/backend_tcp.h include/protocol.h
+CLIENT_SOURCES = src/cache.c src/workload.c src/client.c src/backend_tcp.c src/protocol.c src/backend_sd.c
+CLIENT_HEADERS = include/cache.h include/workload.h include/backend_tcp.h include/protocol.h include/backend_sd.h
 SERVER_SOURCES = src/server.c src/protocol.c
+SD_TEST_SOURCES = src/cache.c src/backend_sd.c tests/test_backend_sd.c
+UBSAN_FLAGS = -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 
-.PHONY: test-client sanitize-client clean-client test-tcp sanitize-tcp
+.PHONY: test-client sanitize-client clean-client test-tcp sanitize-tcp test-sd ubsan test-sd-ubsan
 
 all: build/client build/server
 test: test-client test-tcp
@@ -24,6 +26,7 @@ sanitize-client: build/client_sanitize
 
 clean-client:
 	rm -f build/client build/client_sanitize build/server build/server_sanitize
+	rm -f build/client_ubsan build/server_ubsan build/test_cache_ubsan build/test_backend_sd build/test_backend_sd_ubsan
 
 build/server: $(SERVER_SOURCES) include/protocol.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SERVER_SOURCES) -o $@
@@ -36,3 +39,33 @@ build/server_sanitize: $(SERVER_SOURCES) include/protocol.h | build
 
 sanitize-tcp: build/client_sanitize build/server_sanitize
 	python3 tests/test_tcp.py ./build/client_sanitize ./build/server_sanitize
+
+# SD checks are explicit: they require regular files on a filesystem that
+# reports direct-I/O alignment. They are not silently skipped on other hosts.
+build/test_backend_sd: $(SD_TEST_SOURCES) include/backend_sd.h include/cache.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SD_TEST_SOURCES) -o $@
+
+test-sd: build/client build/test_backend_sd
+	python3 tests/test_sd.py ./build/client
+	./build/test_backend_sd
+
+build/client_ubsan: $(CLIENT_SOURCES) $(CLIENT_HEADERS) | build
+	$(CC) $(CPPFLAGS) $(UBSAN_FLAGS) $(CLIENT_SOURCES) -o $@
+
+build/server_ubsan: $(SERVER_SOURCES) include/protocol.h | build
+	$(CC) $(CPPFLAGS) $(UBSAN_FLAGS) $(SERVER_SOURCES) -o $@
+
+build/test_cache_ubsan: src/cache.c tests/test_cache.c include/cache.h | build
+	$(CC) $(CPPFLAGS) $(UBSAN_FLAGS) src/cache.c tests/test_cache.c -o $@
+
+ubsan: build/client_ubsan build/server_ubsan build/test_cache_ubsan
+	./build/test_cache_ubsan
+	python3 tests/test_client.py ./build/client_ubsan
+	python3 tests/test_tcp.py ./build/client_ubsan ./build/server_ubsan
+
+build/test_backend_sd_ubsan: $(SD_TEST_SOURCES) include/backend_sd.h include/cache.h | build
+	$(CC) $(CPPFLAGS) $(UBSAN_FLAGS) $(SD_TEST_SOURCES) -o $@
+
+test-sd-ubsan: build/client_ubsan build/test_backend_sd_ubsan
+	python3 tests/test_sd.py ./build/client_ubsan
+	./build/test_backend_sd_ubsan
