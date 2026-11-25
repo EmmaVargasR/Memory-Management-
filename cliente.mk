@@ -1,6 +1,6 @@
 # Included from the existing Makefile; preserves all cache test targets.
-CLIENT_SOURCES = src/cache.c src/workload.c src/client.c src/backend_tcp.c src/protocol.c src/backend_sd.c
-CLIENT_HEADERS = include/cache.h include/workload.h include/backend_tcp.h include/protocol.h include/backend_sd.h
+CLIENT_SOURCES = src/metrics.c src/cache.c src/workload.c src/client.c src/backend_tcp.c src/protocol.c src/backend_sd.c
+CLIENT_HEADERS = include/metrics.h include/cache.h include/workload.h include/backend_tcp.h include/protocol.h include/backend_sd.h
 SERVER_SOURCES = src/server.c src/protocol.c
 SD_TEST_SOURCES = src/cache.c src/backend_sd.c tests/test_backend_sd.c
 UBSAN_FLAGS = -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
@@ -106,3 +106,60 @@ test-sd-patterns: build/client
 
 test-sd-patterns-ubsan: build/client_ubsan
 	python3 tests/test_patterns.py ./build/client_ubsan ./build/server_ubsan sd
+
+# Exact latency summaries and byte-coverage instrumentation.
+
+build/test_metrics: src/metrics.c tests/test_metrics.c include/metrics.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/metrics.c tests/test_metrics.c -o $@
+
+build/test_cache_usage: src/cache.c tests/test_cache_usage.c include/cache.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/cache.c tests/test_cache_usage.c -o $@
+
+.PHONY: test-metrics
+test-metrics: build/test_metrics build/test_cache_usage build/client build/server
+	./build/test_metrics
+	./build/test_cache_usage
+	python3 tests/test_instrumentation.py ./build/client ./build/server
+
+build/test_metrics_ubsan: src/metrics.c tests/test_metrics.c include/metrics.h | build
+	$(CC) $(CPPFLAGS) $(UBSAN_FLAGS) src/metrics.c tests/test_metrics.c -o $@
+
+build/test_cache_usage_ubsan: src/cache.c tests/test_cache_usage.c include/cache.h | build
+	$(CC) $(CPPFLAGS) $(UBSAN_FLAGS) src/cache.c tests/test_cache_usage.c -o $@
+
+.PHONY: test-metrics-ubsan
+test-metrics-ubsan: build/test_metrics_ubsan build/test_cache_usage_ubsan build/client_ubsan build/server_ubsan
+	./build/test_metrics_ubsan
+	./build/test_cache_usage_ubsan
+	python3 tests/test_instrumentation.py ./build/client_ubsan ./build/server_ubsan
+
+build/test_metrics_sanitize: src/metrics.c tests/test_metrics.c include/metrics.h | build
+	$(CC) $(CPPFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer src/metrics.c tests/test_metrics.c -o $@
+
+build/test_cache_usage_sanitize: src/cache.c tests/test_cache_usage.c include/cache.h | build
+	$(CC) $(CPPFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer src/cache.c tests/test_cache_usage.c -o $@
+
+.PHONY: sanitize-metrics
+sanitize-metrics: build/test_metrics_sanitize build/test_cache_usage_sanitize build/client_sanitize build/server_sanitize
+	./build/test_metrics_sanitize
+	./build/test_cache_usage_sanitize
+	python3 tests/test_instrumentation.py ./build/client_sanitize ./build/server_sanitize
+
+test: test-metrics
+ubsan: test-metrics-ubsan
+sanitize: sanitize-metrics
+
+.PHONY: test-sd-metrics test-sd-metrics-ubsan clean-metrics
+test-sd: test-sd-metrics
+test-sd-ubsan: test-sd-metrics-ubsan
+
+test-sd-metrics: build/client
+	python3 tests/test_instrumentation.py ./build/client ./build/server sd
+
+test-sd-metrics-ubsan: build/client_ubsan
+	python3 tests/test_instrumentation.py ./build/client_ubsan ./build/server_ubsan sd
+
+clean: clean-metrics
+clean-metrics:
+	rm -f build/test_metrics build/test_metrics_ubsan build/test_metrics_sanitize
+	rm -f build/test_cache_usage build/test_cache_usage_ubsan build/test_cache_usage_sanitize

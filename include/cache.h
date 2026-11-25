@@ -33,4 +33,22 @@ int cache_read(cache_t *cache, uint64_t block_id, size_t offset,
                void *destination, size_t length);
 cache_stats_t cache_get_stats(const cache_t *cache);
 
+/* Same read, additionally reports 1 for a hit and 0 for a miss. The result
+ * flag is meaningful only on success. Existing cache_read callers are valid. */
+int cache_read_ex(cache_t *cache, uint64_t block_id, size_t offset,
+                  void *destination, size_t length, int *was_hit);
+
+typedef struct {
+    int enabled;
+    size_t bitmap_bytes;
+    uint64_t evicted_blocks, evicted_unique_bytes;
+    uint64_t resident_blocks, resident_unique_bytes;
+} cache_usage_stats_t;
+
+/* Optional exact byte coverage, one bitmap bit per payload byte. Enable only
+ * before the first request. Repeated/overlapping reads count bytes once per
+ * residency. Failed loads never finalize an eviction or reset coverage. */
+int cache_enable_usage(cache_t *cache);
+cache_usage_stats_t cache_get_usage(const cache_t *cache);
+
 #endif

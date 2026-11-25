@@ -7,6 +7,8 @@
 typedef struct entry {
     uint64_t id;
     unsigned char *data;
+    unsigned char *coverage;
+    size_t unique_bytes;
     struct entry *hash_next;
     struct entry *previous;
     struct entry *next;
@@ -23,6 +25,9 @@ struct cache {
     cache_loader_fn loader;
     void *context;
     cache_stats_t stats;
+    unsigned char *coverage;
+    size_t coverage_stride, coverage_bytes;
+    uint64_t evicted_unique_bytes;
 };
 
 static size_t bucket_for(const cache_t *cache, uint64_t id)
@@ -121,6 +126,7 @@ void cache_destroy(cache_t *cache)
 {
     if (cache == NULL)
         return;
+    free(cache->coverage);
     free(cache->staging);
     free(cache->data);
     free(cache->buckets);
@@ -128,8 +134,49 @@ void cache_destroy(cache_t *cache)
     free(cache);
 }
 
-int cache_read(cache_t *cache, uint64_t block_id, size_t offset,
-               void *destination, size_t length)
+int cache_enable_usage(cache_t *cache)
+{
+    if (cache == NULL || cache->stats.requests != 0)
+        return -1;
+    if (cache->coverage != NULL)
+        return 0;
+    size_t stride = cache->block_size / 8 + (cache->block_size % 8 != 0);
+    if (cache->capacity > SIZE_MAX / stride)
+        return -1;
+    size_t bytes = stride * cache->capacity;
+    unsigned char *coverage = calloc(bytes, 1);
+    if (coverage == NULL)
+        return -1;
+    /* Touch every allocated page before the measured loop. */
+    volatile unsigned char *touch = coverage;
+    for (size_t i = 0; i < bytes; ) {
+        touch[i] = 0;
+        if (bytes - i <= 4096)
+            break;
+        i += 4096;
+    }
+    touch[bytes - 1] = 0;
+    cache->coverage = coverage;
+    cache->coverage_stride = stride;
+    cache->coverage_bytes = bytes;
+    return 0;
+}
+
+static void record_coverage(entry_t *entry, size_t offset, size_t length)
+{
+    if (entry->coverage == NULL)
+        return;
+    for (size_t i = offset; i < offset + length; i++) {
+        unsigned char mask = (unsigned char)(1u << (i % 8));
+        if ((entry->coverage[i / 8] & mask) == 0) {
+            entry->coverage[i / 8] |= mask;
+            entry->unique_bytes++;
+        }
+    }
+}
+
+int cache_read_ex(cache_t *cache, uint64_t block_id, size_t offset,
+                  void *destination, size_t length, int *was_hit)
 {
     if (cache == NULL || destination == NULL || length == 0 ||
         offset > cache->block_size || length > cache->block_size - offset)
@@ -137,6 +184,8 @@ int cache_read(cache_t *cache, uint64_t block_id, size_t offset,
 
     cache->stats.requests++;
     entry_t *entry = lookup(cache, block_id);
+    if (was_hit != NULL)
+        *was_hit = entry != NULL;
     if (entry != NULL) {
         cache->stats.hits++;
         detach(cache, entry);
@@ -150,14 +199,21 @@ int cache_read(cache_t *cache, uint64_t block_id, size_t offset,
         if (cache->used < cache->capacity) {
             entry = &cache->entries[cache->used];
             entry->data = cache->data + cache->used * cache->block_size;
+            if (cache->coverage != NULL)
+                entry->coverage = cache->coverage + cache->used * cache->coverage_stride;
             cache->used++;
         } else {
             entry = cache->least_recent;
+            if (cache->coverage != NULL)
+                cache->evicted_unique_bytes += entry->unique_bytes;
             hash_remove(cache, entry);
             detach(cache, entry);
             cache->stats.evictions++;
         }
         entry->id = block_id;
+        entry->unique_bytes = 0;
+        if (entry->coverage != NULL)
+            memset(entry->coverage, 0, cache->coverage_stride);
         memcpy(entry->data, cache->staging, cache->block_size);
         size_t bucket = bucket_for(cache, block_id);
         entry->hash_next = cache->buckets[bucket];
@@ -165,7 +221,29 @@ int cache_read(cache_t *cache, uint64_t block_id, size_t offset,
     }
     prepend(cache, entry);
     memcpy(destination, entry->data + offset, length);
+    record_coverage(entry, offset, length);
     return 0;
+}
+
+int cache_read(cache_t *cache, uint64_t block_id, size_t offset,
+               void *destination, size_t length)
+{
+    return cache_read_ex(cache, block_id, offset, destination, length, NULL);
+}
+
+cache_usage_stats_t cache_get_usage(const cache_t *cache)
+{
+    cache_usage_stats_t result = {0};
+    if (cache == NULL || cache->coverage == NULL)
+        return result;
+    result.enabled = 1;
+    result.bitmap_bytes = cache->coverage_bytes;
+    result.evicted_blocks = cache->stats.evictions;
+    result.evicted_unique_bytes = cache->evicted_unique_bytes;
+    result.resident_blocks = cache->used;
+    for (size_t i = 0; i < cache->used; i++)
+        result.resident_unique_bytes += cache->entries[i].unique_bytes;
+    return result;
 }
 
 cache_stats_t cache_get_stats(const cache_t *cache)

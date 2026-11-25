@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cache.h"
+#include "metrics.h"
 #include "workload.h"
 #include "backend_tcp.h"
 #include "backend_sd.h"
@@ -25,6 +26,8 @@ typedef struct {
     uint64_t seed;
     double theta;
     int theta_given;
+    int metrics;
+    const char *latency_csv;
 } options_t;
 
 static void usage(FILE *stream, const char *program)
@@ -36,6 +39,8 @@ static void usage(FILE *stream, const char *program)
         "          [--file DATASET] (required only for --backend sd)\n"
         "          [--pattern sequential|uniform|zipf] [--seed UINT64]\n"
         "          [--zipf-theta VALUE] (0 < VALUE <= 2, zipf only)\n"
+        "          [--metrics on|off] [--latency-csv NEW_FILE] (metrics on only)\n"
+        "Metrics default=on; exact samples and byte coverage add overhead.\n"
         "Sizes are positive decimal bytes, without unit suffixes.\n"
         "Defaults: block=4096 cache=33554432 working-set=268435456 accesses=1000000\n"
         "Default backend=synthetic host=127.0.0.1 port=18083.\n"
@@ -79,6 +84,23 @@ static int positive_size(const char *text, size_t *value)
 static int parse_options(int argc, char **argv, options_t *options)
 {
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--metrics") == 0) {
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "on") != 0 &&
+                                  strcmp(argv[i + 1], "off") != 0)) {
+                fputs("Invalid metrics mode: use on or off.\n", stderr);
+                return -1;
+            }
+            options->metrics = strcmp(argv[++i], "on") == 0;
+            continue;
+        }
+        if (strcmp(argv[i], "--latency-csv") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                fputs("--latency-csv requires a new file path.\n", stderr);
+                return -1;
+            }
+            options->latency_csv = argv[++i];
+            continue;
+        }
         if (strcmp(argv[i], "--seed") == 0) {
             if (i + 1 >= argc || parse_seed(argv[++i], &options->seed) != 0) {
                 fputs("Invalid seed: use a decimal uint64, including zero.\n", stderr);
@@ -138,6 +160,10 @@ static int parse_options(int argc, char **argv, options_t *options)
             fprintf(stderr, "Invalid positive integer: %s\n", argv[i]);
             return -1;
         }
+    }
+    if (!options->metrics && options->latency_csv != NULL) {
+        fputs("--latency-csv requires --metrics on.\n", stderr);
+        return -1;
     }
     if (options->port > 65535 ||
         (strcmp(options->backend, "synthetic") != 0 &&
@@ -204,11 +230,114 @@ static void close_backends(tcp_backend_t *tcp, sd_backend_t *sd)
     sd_backend_close(sd);
 }
 
+typedef struct {
+    cache_loader_fn load;
+    void *context;
+    uint64_t last_ns;
+} timed_backend_t;
+
+static int timed_load(void *context, uint64_t block_id, void *destination, size_t block_size)
+{
+    timed_backend_t *backend = context;
+    struct timespec start, end;
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &start) != 0)
+        return -1;
+    int result = backend->load(backend->context, block_id, destination, block_size);
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &end) != 0 ||
+        metrics_elapsed_ns(start, end, &backend->last_ns) != 0)
+        return -1;
+    return result;
+}
+
+static int export_latencies(const latency_store_t *store, const char *path)
+{
+    FILE *file = fopen(path, "wx");
+    if (file == NULL) {
+        perror("Create latency CSV (existing files are not overwritten)");
+        return -1;
+    }
+    int failed = fputs("access_index,was_hit,access_ns,backend_ns\n", file) == EOF;
+    for (size_t i = 0; i < store->count && !failed; i++) {
+        const latency_sample_t *sample = &store->samples[i];
+        failed = fprintf(file, "%zu,%d,%" PRIu64 ",%" PRIu64 "\n", i,
+                         sample->was_hit, sample->access_ns, sample->backend_ns) < 0;
+    }
+    if (fclose(file) != 0)
+        failed = 1;
+    if (failed) {
+        fputs("Could not finish latency CSV; partial file removed.\n", stderr);
+        (void)remove(path);
+        return -1;
+    }
+    return 0;
+}
+
+static void print_fraction(const char *name, uint64_t bytes, uint64_t blocks, size_t size)
+{
+    if (blocks == 0)
+        printf("%s=na\n", name);
+    else
+        printf("%s=%.9Lf\n", name, (long double)bytes / ((long double)blocks * size));
+}
+
+static int print_metrics(const latency_store_t *store, const cache_t *cache, size_t block_size)
+{
+    const char *names[] = {"all", "hit", "miss", "backend"};
+    latency_summary_t summaries[4];
+    for (size_t i = 0; i < 4; i++)
+        if (latency_summarize(store, (latency_group_t)i, &summaries[i]) != 0) {
+            fputs("Could not allocate latency summary scratch memory.\n", stderr);
+            return -1;
+        }
+    puts("metrics_version=latency-usage-v1\nlatency_clock=CLOCK_MONOTONIC_RAW\nlatency_unit=ns\n"
+         "latency_percentile_method=nearest_rank\n"
+         "latency_scope=cache_read_including_usage_and_timing_instrumentation\n"
+         "backend_latency_scope=loader_callback_excluding_cache_copy_and_lru\n"
+         "latency_overhead_subtracted=0");
+    printf("metrics_sample_bytes=%zu\nlatency_summary_scratch_bytes=%zu\n",
+           store->capacity * sizeof(latency_sample_t), store->count * sizeof(uint64_t));
+    for (size_t i = 0; i < 4; i++) {
+        latency_summary_t *summary = &summaries[i];
+        printf("latency_%s_count=%zu\n", names[i], summary->count);
+        if (summary->count == 0) {
+            printf("latency_%s_sum_ns=na\nlatency_%s_mean_ns=na\n"
+                   "latency_%s_min_ns=na\nlatency_%s_p50_ns=na\n"
+                   "latency_%s_p95_ns=na\nlatency_%s_p99_ns=na\nlatency_%s_max_ns=na\n",
+                   names[i], names[i], names[i], names[i], names[i], names[i], names[i]);
+        } else {
+            printf("latency_%s_sum_ns=%.0Lf\nlatency_%s_mean_ns=%.3Lf\n",
+                   names[i], summary->sum_ns, names[i], summary->mean_ns);
+            printf("latency_%s_min_ns=%" PRIu64 "\nlatency_%s_p50_ns=%" PRIu64
+                   "\nlatency_%s_p95_ns=%" PRIu64 "\nlatency_%s_p99_ns=%" PRIu64
+                   "\nlatency_%s_max_ns=%" PRIu64 "\n",
+                   names[i], summary->min_ns, names[i], summary->p50_ns,
+                   names[i], summary->p95_ns, names[i], summary->p99_ns,
+                   names[i], summary->max_ns);
+        }
+    }
+    cache_usage_stats_t usage = cache_get_usage(cache);
+    puts("block_usage_unit=distinct_bytes_per_residency\n"
+         "block_usage_resident_scope=partial_lifetimes_at_end");
+    printf("usage_bitmap_bytes=%zu\nusage_evicted_blocks=%" PRIu64
+           "\nusage_evicted_unique_bytes=%" PRIu64 "\nusage_resident_blocks=%" PRIu64
+           "\nusage_resident_unique_bytes=%" PRIu64 "\n",
+           usage.bitmap_bytes, usage.evicted_blocks, usage.evicted_unique_bytes,
+           usage.resident_blocks, usage.resident_unique_bytes);
+    print_fraction("block_utilization_evicted", usage.evicted_unique_bytes,
+                   usage.evicted_blocks, block_size);
+    print_fraction("block_utilization_resident", usage.resident_unique_bytes,
+                   usage.resident_blocks, block_size);
+    print_fraction("block_utilization_all_loaded",
+                   usage.evicted_unique_bytes + usage.resident_unique_bytes,
+                   usage.evicted_blocks + usage.resident_blocks, block_size);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     options_t options = {4096, 33554432, 268435456, 1000000,
                           "synthetic", "127.0.0.1", 18083, NULL,
-                          "sequential", 42, 1.1, 0};
+                          "sequential", 42, 1.1, 0, 1, NULL};
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         usage(stdout, argv[0]);
         return EXIT_SUCCESS;
@@ -243,6 +372,12 @@ int main(int argc, char **argv)
         loader = sd_backend_load;
         loader_context = &sd;
     }
+    timed_backend_t timed = {.load = loader, .context = loader_context};
+    if (options.metrics) {
+        loader = timed_load;
+        loader_context = &timed;
+    }
+    latency_store_t latencies = {0};
     cache_t *cache = cache_create(options.cache_bytes / options.block_size,
                                   options.block_size, loader, loader_context);
     if (cache == NULL) {
@@ -251,12 +386,16 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    int exit_code = EXIT_FAILURE;
+    if (options.metrics && (cache_enable_usage(cache) != 0 ||
+                           latency_store_init(&latencies, options.accesses) != 0)) {
+        fputs("Could not allocate metrics memory; reduce accesses or cache size.\n", stderr);
+        goto cleanup;
+    }
     struct timespec start, end;
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &start) != 0) {
         perror("clock_gettime");
-        cache_destroy(cache);
-        close_backends(&tcp, &sd);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
     uint64_t checksum = 0;
     uint64_t trace_hash = UINT64_C(14695981039346656037);
@@ -270,11 +409,32 @@ int main(int argc, char **argv)
         uint64_t block_id = (uint64_t)(address / options.block_size);
         size_t offset = address % options.block_size;
         unsigned char bytes[8];
-        if (cache_read(cache, block_id, offset, bytes, sizeof(bytes)) != 0) {
+        int result;
+        if (options.metrics) {
+            struct timespec access_start, access_end;
+            int was_hit = 0;
+            uint64_t ns;
+            timed.last_ns = 0;
+            if (clock_gettime(CLOCK_MONOTONIC_RAW, &access_start) != 0) {
+                perror("Access clock");
+                goto cleanup;
+            }
+            result = cache_read_ex(cache, block_id, offset, bytes, sizeof(bytes), &was_hit);
+            if (clock_gettime(CLOCK_MONOTONIC_RAW, &access_end) != 0 ||
+                metrics_elapsed_ns(access_start, access_end, &ns) != 0) {
+                fputs("Invalid access clock measurement.\n", stderr);
+                goto cleanup;
+            }
+            if (result == 0 && latency_record(&latencies, ns, was_hit, timed.last_ns) != 0) {
+                fputs("Could not record access latency.\n", stderr);
+                goto cleanup;
+            }
+        } else {
+            result = cache_read(cache, block_id, offset, bytes, sizeof(bytes));
+        }
+        if (result != 0) {
             fprintf(stderr, "Read failed at access %zu.\n", i);
-            cache_destroy(cache);
-            close_backends(&tcp, &sd);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
         /* Defined unsigned wraparound; independent of machine byte order. */
         for (size_t j = 0; j < sizeof(bytes); j++)
@@ -282,10 +442,10 @@ int main(int argc, char **argv)
     }
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &end) != 0) {
         perror("clock_gettime");
-        cache_destroy(cache);
-        close_backends(&tcp, &sd);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
+    if (options.latency_csv != NULL && export_latencies(&latencies, options.latency_csv) != 0)
+        goto cleanup;
     double seconds = elapsed_seconds(start, end);
     cache_stats_t stats = cache_get_stats(cache);
     printf("backend=%s\npattern=%s\ncache_start=empty\n"
@@ -317,8 +477,14 @@ int main(int argc, char **argv)
            use_sd ? 1 : 0, use_sd ? "statx" : "none",
            sd.memory_alignment, sd.offset_alignment,
            sd.requests, sd.read_calls, sd.read_bytes);
-    puts("timing_scope=loop_including_generator_backend_and_checksums_excluding_setup");
+    printf("metrics_enabled=%d\n", options.metrics);
+    puts("timing_scope=loop_including_generator_backend_checksums_and_optional_metrics_excluding_setup_and_summary");
+    if (options.metrics && print_metrics(&latencies, cache, options.block_size) != 0)
+        goto cleanup;
+    exit_code = EXIT_SUCCESS;
+cleanup:
+    latency_store_destroy(&latencies);
     cache_destroy(cache);
     close_backends(&tcp, &sd);
-    return EXIT_SUCCESS;
+    return exit_code;
 }
