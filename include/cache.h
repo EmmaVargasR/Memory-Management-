@@ -51,4 +51,10 @@ typedef struct {
 int cache_enable_usage(cache_t *cache);
 cache_usage_stats_t cache_get_usage(const cache_t *cache);
 
+/* Begin a new observation window: zero request/eviction counters and byte
+ * coverage, preserving payloads, hash entries, resident count and LRU order.
+ * Does not change the loader, allocate memory or load any block. Enable usage
+ * before filling the cache. Returns -1 for NULL, otherwise 0. */
+int cache_reset_observations(cache_t *cache);
+
 #endif

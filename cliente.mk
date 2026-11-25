@@ -163,3 +163,45 @@ clean: clean-metrics
 clean-metrics:
 	rm -f build/test_metrics build/test_metrics_ubsan build/test_metrics_sanitize
 	rm -f build/test_cache_usage build/test_cache_usage_ubsan build/test_cache_usage_sanitize
+
+build/test_b0: src/cache.c tests/test_b0.c include/cache.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/cache.c tests/test_b0.c -o $@
+
+.PHONY: test-b0
+test-b0: build/test_b0 build/client build/server
+	./build/test_b0
+	python3 tests/test_b0.py ./build/client ./build/server
+
+build/test_b0_ubsan: src/cache.c tests/test_b0.c include/cache.h | build
+	$(CC) $(CPPFLAGS) $(UBSAN_FLAGS) src/cache.c tests/test_b0.c -o $@
+
+.PHONY: test-b0-ubsan
+test-b0-ubsan: build/test_b0_ubsan build/client_ubsan build/server_ubsan
+	./build/test_b0_ubsan
+	python3 tests/test_b0.py ./build/client_ubsan ./build/server_ubsan
+
+build/test_b0_sanitize: src/cache.c tests/test_b0.c include/cache.h | build
+	$(CC) $(CPPFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer src/cache.c tests/test_b0.c -o $@
+
+.PHONY: sanitize-b0
+sanitize-b0: build/test_b0_sanitize build/client_sanitize build/server_sanitize
+	./build/test_b0_sanitize
+	python3 tests/test_b0.py ./build/client_sanitize ./build/server_sanitize
+
+test: test-b0
+ubsan: test-b0-ubsan
+sanitize: sanitize-b0
+
+.PHONY: test-sd-b0 test-sd-b0-ubsan clean-b0
+test-sd: test-sd-b0
+test-sd-ubsan: test-sd-b0-ubsan
+
+test-sd-b0: build/client
+	python3 tests/test_b0.py ./build/client ./build/server sd
+
+test-sd-b0-ubsan: build/client_ubsan
+	python3 tests/test_b0.py ./build/client_ubsan ./build/server_ubsan sd
+
+clean: clean-b0
+clean-b0:
+	rm -f build/test_b0 build/test_b0_ubsan build/test_b0_sanitize

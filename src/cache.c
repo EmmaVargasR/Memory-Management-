@@ -136,7 +136,7 @@ void cache_destroy(cache_t *cache)
 
 int cache_enable_usage(cache_t *cache)
 {
-    if (cache == NULL || cache->stats.requests != 0)
+    if (cache == NULL || cache->stats.requests != 0 || cache->used != 0)
         return -1;
     if (cache->coverage != NULL)
         return 0;
@@ -249,4 +249,17 @@ cache_usage_stats_t cache_get_usage(const cache_t *cache)
 cache_stats_t cache_get_stats(const cache_t *cache)
 {
     return cache != NULL ? cache->stats : (cache_stats_t){0};
+}
+
+int cache_reset_observations(cache_t *cache)
+{
+    if (cache == NULL)
+        return -1;
+    cache->stats = (cache_stats_t){0};
+    cache->evicted_unique_bytes = 0;
+    if (cache->coverage != NULL)
+        memset(cache->coverage, 0, cache->coverage_bytes);
+    for (size_t i = 0; i < cache->used; i++)
+        cache->entries[i].unique_bytes = 0;
+    return 0;
 }
