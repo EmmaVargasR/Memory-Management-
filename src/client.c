@@ -2,6 +2,7 @@
 #include "cache.h"
 #include "workload.h"
 #include "backend_tcp.h"
+#include "backend_sd.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -18,6 +19,7 @@ typedef struct {
     const char *backend;
     const char *host;
     size_t port;
+    const char *file;
 } options_t;
 
 static void usage(FILE *stream, const char *program)
@@ -25,7 +27,8 @@ static void usage(FILE *stream, const char *program)
     fprintf(stream,
         "Usage: %s [--block-size BYTES] [--cache-size BYTES]\n"
         "          [--working-set BYTES] [--accesses COUNT]\n"
-        "          [--backend synthetic|tcp] [--host IPv4] [--port PORT]\n"
+        "          [--backend synthetic|tcp|sd] [--host IPv4] [--port PORT]\n"
+        "          [--file DATASET] (required only for --backend sd)\n"
         "Sizes are positive decimal bytes, without unit suffixes.\n"
         "Defaults: block=4096 cache=33554432 working-set=268435456 accesses=1000000\n"
         "Default backend=synthetic host=127.0.0.1 port=18083.\n"
@@ -52,15 +55,18 @@ static int positive_size(const char *text, size_t *value)
 static int parse_options(int argc, char **argv, options_t *options)
 {
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--backend") == 0 || strcmp(argv[i], "--host") == 0) {
+        if (strcmp(argv[i], "--backend") == 0 || strcmp(argv[i], "--host") == 0 ||
+            strcmp(argv[i], "--file") == 0) {
             if (i + 1 >= argc) {
-                fputs("Missing backend or host value.\n", stderr);
+                fputs("Missing backend, host or file value.\n", stderr);
                 return -1;
             }
             if (strcmp(argv[i], "--backend") == 0)
                 options->backend = argv[++i];
-            else
+            else if (strcmp(argv[i], "--host") == 0)
                 options->host = argv[++i];
+            else
+                options->file = argv[++i];
             continue;
         }
         size_t *destination = NULL;
@@ -84,7 +90,8 @@ static int parse_options(int argc, char **argv, options_t *options)
         }
     }
     if (options->port > 65535 ||
-        (strcmp(options->backend, "synthetic") != 0 && strcmp(options->backend, "tcp") != 0)) {
+        (strcmp(options->backend, "synthetic") != 0 &&
+         strcmp(options->backend, "tcp") != 0 && strcmp(options->backend, "sd") != 0)) {
         fputs("Invalid port or backend.\n", stderr);
         return -1;
     }
@@ -93,6 +100,19 @@ static int parse_options(int argc, char **argv, options_t *options)
         options->working_set_bytes % options->block_size != 0) {
         fputs("Block size must be a multiple of 8; cache and working set must "
               "be positive multiples of block size.\n", stderr);
+        return -1;
+    }
+    if (strcmp(options->backend, "sd") == 0) {
+        if (options->file == NULL || options->file[0] == '\0') {
+            fputs("--file is required for --backend sd.\n", stderr);
+            return -1;
+        }
+        if (options->block_size < 4096 || options->block_size % 4096 != 0) {
+            fputs("SD block size must be divisible by 4096 and at least 4096.\n", stderr);
+            return -1;
+        }
+    } else if (options->file != NULL) {
+        fputs("--file requires --backend sd.\n", stderr);
         return -1;
     }
     return 0;
@@ -119,10 +139,16 @@ static double elapsed_seconds(struct timespec start, struct timespec end)
            (double)(end.tv_nsec - start.tv_nsec) / 1000000000.0;
 }
 
+static void close_backends(tcp_backend_t *tcp, sd_backend_t *sd)
+{
+    tcp_backend_close(tcp);
+    sd_backend_close(sd);
+}
+
 int main(int argc, char **argv)
 {
     options_t options = {4096, 33554432, 268435456, 1000000,
-                          "synthetic", "127.0.0.1", 18083};
+                          "synthetic", "127.0.0.1", 18083, NULL};
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         usage(stdout, argv[0]);
         return EXIT_SUCCESS;
@@ -136,21 +162,29 @@ int main(int argc, char **argv)
     if (sequential_init(&workload, options.working_set_bytes) != 0)
         return EXIT_FAILURE;
     tcp_backend_t tcp = {.fd = -1};
+    sd_backend_t sd = {.fd = -1};
     cache_loader_fn loader = synthetic_load;
     void *loader_context = &options;
     int use_tcp = strcmp(options.backend, "tcp") == 0;
+    int use_sd = strcmp(options.backend, "sd") == 0;
     if (use_tcp) {
         if (tcp_backend_open(&tcp, options.host, (uint16_t)options.port,
                              options.block_size, options.working_set_bytes) != 0)
             return EXIT_FAILURE;
         loader = tcp_backend_load;
         loader_context = &tcp;
+    } else if (use_sd) {
+        if (sd_backend_open(&sd, options.file, options.block_size,
+                              options.working_set_bytes) != 0)
+            return EXIT_FAILURE;
+        loader = sd_backend_load;
+        loader_context = &sd;
     }
     cache_t *cache = cache_create(options.cache_bytes / options.block_size,
                                   options.block_size, loader, loader_context);
     if (cache == NULL) {
         fputs("Could not allocate cache.\n", stderr);
-        tcp_backend_close(&tcp);
+        close_backends(&tcp, &sd);
         return EXIT_FAILURE;
     }
 
@@ -158,7 +192,7 @@ int main(int argc, char **argv)
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &start) != 0) {
         perror("clock_gettime");
         cache_destroy(cache);
-        tcp_backend_close(&tcp);
+        close_backends(&tcp, &sd);
         return EXIT_FAILURE;
     }
     uint64_t checksum = 0;
@@ -170,7 +204,7 @@ int main(int argc, char **argv)
         if (cache_read(cache, block_id, offset, bytes, sizeof(bytes)) != 0) {
             fprintf(stderr, "Read failed at access %zu.\n", i);
             cache_destroy(cache);
-            tcp_backend_close(&tcp);
+            close_backends(&tcp, &sd);
             return EXIT_FAILURE;
         }
         /* Defined unsigned wraparound; independent of machine byte order. */
@@ -180,7 +214,7 @@ int main(int argc, char **argv)
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &end) != 0) {
         perror("clock_gettime");
         cache_destroy(cache);
-        tcp_backend_close(&tcp);
+        close_backends(&tcp, &sd);
         return EXIT_FAILURE;
     }
     double seconds = elapsed_seconds(start, end);
@@ -199,8 +233,15 @@ int main(int argc, char **argv)
            seconds, seconds > 0.0 ? (double)stats.requests / seconds : 0.0);
     printf("tcp_connections=%d\ntcp_requests=%" PRIu64 "\ntcp_payload_bytes=%" PRIu64 "\n",
            use_tcp ? 1 : 0, tcp.requests, tcp.payload_bytes);
-    puts("timing_scope=loop_including_backend_loads_and_checksum_excluding_connect_and_handshake");
+    printf("sd_open_direct=%d\nsd_alignment_source=%s\n"
+           "sd_memory_alignment_bytes=%zu\nsd_offset_alignment_bytes=%zu\n"
+           "sd_requests=%" PRIu64 "\nsd_read_calls=%" PRIu64
+           "\nsd_read_bytes=%" PRIu64 "\n",
+           use_sd ? 1 : 0, use_sd ? "statx" : "none",
+           sd.memory_alignment, sd.offset_alignment,
+           sd.requests, sd.read_calls, sd.read_bytes);
+    puts("timing_scope=loop_including_backend_loads_and_checksum_excluding_backend_setup");
     cache_destroy(cache);
-    tcp_backend_close(&tcp);
+    close_backends(&tcp, &sd);
     return EXIT_SUCCESS;
 }
