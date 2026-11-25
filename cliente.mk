@@ -205,3 +205,30 @@ test-sd-b0-ubsan: build/client_ubsan
 clean: clean-b0
 clean-b0:
 	rm -f build/test_b0 build/test_b0_ubsan build/test_b0_sanitize
+
+# Zipf 80/20: use the same workload generator as the client, without cache I/O.
+build/zipf_probe: src/workload.c src/zipf_probe.c include/workload.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/workload.c src/zipf_probe.c -o $@ $(LDLIBS)
+
+build/zipf_probe_ubsan: src/workload.c src/zipf_probe.c include/workload.h | build
+	$(CC) $(CPPFLAGS) $(UBSAN_FLAGS) src/workload.c src/zipf_probe.c -o $@ $(LDLIBS)
+
+build/zipf_probe_sanitize: src/workload.c src/zipf_probe.c include/workload.h | build
+	$(CC) $(CPPFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer src/workload.c src/zipf_probe.c -o $@ $(LDLIBS)
+
+.PHONY: test-zipf test-zipf-ubsan sanitize-zipf clean-zipf
+test-zipf: build/zipf_probe build/client
+	python3 tests/test_zipf_calibration.py ./build/zipf_probe ./build/client
+
+test-zipf-ubsan: build/zipf_probe_ubsan build/client_ubsan
+	python3 tests/test_zipf_calibration.py ./build/zipf_probe_ubsan ./build/client_ubsan
+
+sanitize-zipf: build/zipf_probe_sanitize build/client_sanitize
+	python3 tests/test_zipf_calibration.py ./build/zipf_probe_sanitize ./build/client_sanitize
+
+test: test-zipf
+ubsan: test-zipf-ubsan
+sanitize: sanitize-zipf
+clean: clean-zipf
+clean-zipf:
+	rm -f build/zipf_probe build/zipf_probe_ubsan build/zipf_probe_sanitize
